@@ -40,7 +40,7 @@ note() { printf '%s\n' "$1" >&2; }
 
 # The Claude Code process that armed this hold. A `start` with no owner runs its full
 # deadline even if Claude crashed, quit or ran out of credit minutes later — on a closed lid
-# that is pure waste, which is exactly what Ahmed asked to stop.
+# that is pure waste, which is exactly what the user asked to stop.
 owning_claude() {
   local p=$PPID
   for _ in 1 2 3 4 5 6; do
