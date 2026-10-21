@@ -40,6 +40,7 @@ final class Model: ObservableObject {
     @Published var watcher = ""
     @Published var busy = false
     @Published var launchAtLogin = false
+    @Published var showHelp = false
     @Published var pluggedInOnly = true
     @Published var sessionNames: [String] = []
     @Published var events: [Event] = []
@@ -113,16 +114,16 @@ final class Model: ObservableObject {
             if msg.hasPrefix("no owner") || msg.hasPrefix("superseding") || msg.hasPrefix("owner:") || msg.hasPrefix("(dry run") || msg.hasPrefix("(test)") { continue }
             let t = inFmt.date(from: stamp).map(clock12) ?? stamp.suffix(8).description
             let (text, sym): (String, String)
-            if msg.hasPrefix("held") { (text, sym) = ("Held" + (msg.range(of: #"battery \d+%"#, options: .regularExpression).map { " · " + msg[$0] } ?? ""), "cup.and.saucer") }
-            else if msg.contains("Claude finished") { (text, sym) = ("Released — Claude finished", "checkmark.circle") }
-            else if msg.hasPrefix("released") { (text, sym) = ("Released", "moon") }
-            else if msg.hasPrefix("refused") { (text, sym) = ("Refused — " + msg.dropFirst("refused: ".count), "hand.raised") }
-            else if msg.contains("critical") { (text, sym) = ("Battery critical — put the Mac to sleep", "battery.0percent") }
-            else if msg.contains("floor") { (text, sym) = ("Released — " + msg, "battery.25percent") }
-            else if msg.hasPrefix("stopping") { (text, sym) = ("Stopped by hand", "hand.raised") }
-            else if msg.contains("deadline") { (text, sym) = ("Released — time limit reached", "timer") }
-            else if msg.contains("idle") { (text, sym) = ("Released — machine idle", "zzz") }
-            else if msg.contains("unplugged") { (text, sym) = ("Released — unplugged", "powerplug") }
+            if msg.hasPrefix("held") { (text, sym) = ("Kept awake" + (msg.range(of: #"battery \d+%"#, options: .regularExpression).map { " (" + msg[$0] + ")" } ?? ""), "cup.and.saucer") }
+            else if msg.contains("Claude finished") { (text, sym) = ("Let it sleep — Claude finished", "checkmark.circle") }
+            else if msg.hasPrefix("released") { (text, sym) = ("Let it sleep", "moon") }
+            else if msg.hasPrefix("refused") { (text, sym) = ("Didn't hold — " + msg.dropFirst("refused: ".count).replacingOccurrences(of: "plugged-in-only is on", with: "“only while plugged in” is on"), "hand.raised") }
+            else if msg.contains("critical") { (text, sym) = ("Battery almost empty — put the Mac to sleep", "battery.0percent") }
+            else if msg.contains("floor") { (text, sym) = ("Let it sleep — battery low", "battery.25percent") }
+            else if msg.hasPrefix("stopping") { (text, sym) = ("You turned it off", "hand.raised") }
+            else if msg.contains("deadline") { (text, sym) = ("Let it sleep — time was up", "timer") }
+            else if msg.contains("idle") { (text, sym) = ("Let it sleep — nothing was running", "zzz") }
+            else if msg.contains("unplugged") { (text, sym) = ("Let it sleep — you unplugged it", "powerplug") }
             else { (text, sym) = (msg, "circle") }
             out.append(Event(time: t, text: text, symbol: sym))
             if out.count == 5 { break }
@@ -164,16 +165,16 @@ struct ContentView: View {
     @ObservedObject var model: Model
     var tint: Color { switch model.mode { case .holding: return .green; case .normal: return .secondary; case .off: return .blue; case .orphaned: return .orange } }
     var symbol: String { switch model.mode { case .holding: return "cup.and.saucer.fill"; case .normal: return "moon.fill"; case .off: return "moon.zzz.fill"; case .orphaned: return "exclamationmark.triangle.fill" } }
-    var title: String { switch model.mode { case .holding: return "Staying awake"; case .normal: return "Normal sleep"; case .off: return "Feature off"; case .orphaned: return "Orphaned hold" } }
+    var title: String { switch model.mode { case .holding: return "Keeping the Mac awake"; case .normal: return "Not keeping it awake"; case .off: return "Turned off"; case .orphaned: return "Something's stuck" } }
     var subtitle: String {
         switch model.mode {
         case .holding:
-            var s = model.sessions > 0 ? "Claude is working in \(model.sessions) session\(model.sessions == 1 ? "" : "s")" : "Waiting for Claude to finish"
-            if let d = model.deadline { s += " · until \(clock12(d)) at most" }
+            var s = model.sessions > 0 ? "Claude is working in \(model.sessions) project\(model.sessions == 1 ? "" : "s"). The lid won't put it to sleep." : "Waiting for Claude to start working."
+            if let d = model.deadline { s += " Stops by \(clock12(d)) at the latest." }
             return s
-        case .normal: return "The lid sleeps the Mac like any laptop"
-        case .off: return "No automatic holds. Sleeps like normal."
-        case .orphaned: return "Sleep is disabled but nothing is watching it"
+        case .normal: return "Close the lid and the Mac sleeps, like any laptop."
+        case .off: return "Nothing happens on its own. The Mac sleeps like normal."
+        case .orphaned: return "Sleep is blocked but nothing is in charge of it. Click “Let it sleep”."
         }
     }
     var batterySymbol: String {
@@ -223,8 +224,8 @@ struct ContentView: View {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "bolt.slash").foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("On battery — holds are off").font(.callout.weight(.medium))
-                        Text("Plug in, turn off “Only while plugged in”, or hold anyway (the 25% and 10% floors still apply).").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Text("You're on battery, so it won't stay awake").font(.callout.weight(.medium))
+                        Text("Plug in, or turn off “Only while plugged in” below. You can also override it once; it will still sleep at 10% to save the battery.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 .padding(10)
@@ -232,17 +233,17 @@ struct ContentView: View {
             }
             VStack(spacing: 8) {
                 if model.onBatteryBlocked && model.mode != .off {
-                    Button(action: model.holdAnyway) { Label("Hold on battery anyway", systemImage: "cup.and.saucer").frame(maxWidth: .infinity) }
+                    Button(action: model.holdAnyway) { Label("Keep awake on battery anyway", systemImage: "cup.and.saucer").frame(maxWidth: .infinity) }
                         .buttonStyle(.borderedProminent).controlSize(.large).tint(.orange)
                 } else if model.mode == .holding || model.mode == .orphaned {
-                    Button(action: model.release) { Label("Let it sleep normally", systemImage: "moon").frame(maxWidth: .infinity) }
+                    Button(action: model.release) { Label("Let it sleep", systemImage: "moon").frame(maxWidth: .infinity) }
                         .buttonStyle(.borderedProminent).controlSize(.large).tint(tint == .secondary ? .accentColor : tint)
                 } else {
-                    Button(action: model.holdUntilDone) { Label("Keep awake until Claude finishes", systemImage: "cup.and.saucer").frame(maxWidth: .infinity) }
+                    Button(action: model.holdUntilDone) { Label("Keep awake while Claude works", systemImage: "cup.and.saucer").frame(maxWidth: .infinity) }
                         .buttonStyle(.borderedProminent).controlSize(.large)
                 }
                 HStack(spacing: 8) {
-                    Button(action: model.holdTwoHours) { Label("2 h, regardless", systemImage: "timer").frame(maxWidth: .infinity) }
+                    Button(action: model.holdTwoHours) { Label("2 hours", systemImage: "timer").frame(maxWidth: .infinity) }
                         .disabled(model.onBatteryBlocked)
                     Button(action: model.sleepMac) { Label("Sleep now", systemImage: "powersleep").frame(maxWidth: .infinity) }
                 }.buttonStyle(.bordered).controlSize(.regular)
@@ -253,24 +254,24 @@ struct ContentView: View {
             Toggle(isOn: Binding(get: { model.mode != .off }, set: { model.setAutomatic($0) })) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Automatic").font(.callout.weight(.medium))
-                    Text("Hold while Claude works, release when it finishes").font(.caption).foregroundStyle(.secondary)
+                    Text("Turns on by itself when Claude is working, off when it's done").font(.caption).foregroundStyle(.secondary)
                 }
             }.toggleStyle(.switch)
 
             Toggle(isOn: Binding(get: { model.pluggedInOnly }, set: { model.setPluggedInOnly($0) })) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Only while plugged in").font(.callout.weight(.medium))
-                    Text("On battery, the Mac sleeps like a normal laptop").font(.caption).foregroundStyle(.secondary)
+                    Text("Never on battery, so it can't drain it overnight").font(.caption).foregroundStyle(.secondary)
                 }
             }.toggleStyle(.switch)
             Toggle(isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) })) {
-                Text("Launch at login").font(.callout.weight(.medium))
+                Text("Start when I log in").font(.callout.weight(.medium))
             }.toggleStyle(.switch).controlSize(.small)
 
             if !model.events.isEmpty {
                 Divider()
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Recent").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text("What happened").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     ForEach(model.events) { ev in
                         HStack(spacing: 6) {
                             Image(systemName: ev.symbol).font(.caption2).foregroundStyle(.secondary).frame(width: 12)
@@ -281,7 +282,17 @@ struct ContentView: View {
                 }
             }
 
+            if model.showHelp {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Macs sleep when you close the lid. Agent Awake keeps yours awake only while Claude is working, then lets it sleep like normal. It never stops you sleeping it yourself.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 12) {
+                        Label("awake", systemImage: "cup.and.saucer.fill"); Label("normal", systemImage: "moon"); Label("off", systemImage: "moon.zzz"); Label("stuck", systemImage: "exclamationmark.triangle.fill")
+                    }.font(.caption2).foregroundStyle(.secondary)
+                }
+                .padding(10).background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
+            }
             HStack {
+                Button(action: { model.showHelp.toggle() }) { Image(systemName: "questionmark.circle") }.buttonStyle(.plain).foregroundStyle(.secondary).help("What is this?")
                 Text("Agent Awake").font(.caption2).foregroundStyle(.tertiary)
                 Text("·").font(.caption2).foregroundStyle(.tertiary)
                 Text("\(hotkeyLabel) opens this").font(.caption2).foregroundStyle(.tertiary)
@@ -377,6 +388,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // --snapshot <png> [holding|normal|off|orphaned]: render the popover offscreen and exit. The
 // only reliable way to look at the UI from a script — a transient popover closes before a
 // screenshot can catch it.
+if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--icon" {
+    // --icon out.png <symbol> [size] : the status-bar glyph as a PNG, for documentation.
+    let napp = NSApplication.shared; napp.setActivationPolicy(.prohibited); napp.finishLaunching()
+    let size = CGFloat(Double(CommandLine.arguments.count > 4 ? CommandLine.arguments[4] : "88") ?? 88)
+    let cfg = NSImage.SymbolConfiguration(pointSize: size * 0.72, weight: .medium)
+    let img = NSImage(systemSymbolName: CommandLine.arguments[3], accessibilityDescription: nil)!.withSymbolConfiguration(cfg)!
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size), pixelsHigh: Int(size), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    let r = NSRect(x: (size - img.size.width) / 2, y: (size - img.size.height) / 2, width: img.size.width, height: img.size.height)
+    NSColor.white.set(); img.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1)
+    // tint: draw white through the glyph as a mask
+    NSGraphicsContext.restoreGraphicsState()
+    let data = rep.representation(using: .png, properties: [:])!
+    try! data.write(to: URL(fileURLWithPath: CommandLine.arguments[2])); print("icon \(CommandLine.arguments[3]) -> \(CommandLine.arguments[2])"); exit(0)
+}
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
     // AppKit must exist before any view is built; without this the hosting view blocks forever.
     let napp = NSApplication.shared; napp.setActivationPolicy(.prohibited); napp.finishLaunching()

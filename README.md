@@ -2,7 +2,7 @@
 
 A menu-bar switch that keeps your Mac awake with the lid closed **while an AI agent is working**, lets it sleep normally the moment the agent finishes, and never fights you when *you* want it asleep.
 
-![Agent Awake](docs/screenshot.png)
+![Agent Awake](docs/screenshot.jpg)
 
 Built because a Claude Code session kept dying when the laptop lid closed — and the tools that fix that (`pmset disablesleep`, Amphetamine's closed-display mode) also block *every* sleep, drain the battery to zero overnight, and leave the hold on after the work ends.
 
@@ -35,16 +35,17 @@ A prebuilt `Agent Awake.app` is attached to each release for people who don't wa
 
 | in the menu | what it does |
 |---|---|
-| **Keep awake until Claude finishes** | holds; releases when no session is mid-turn, or after 10 idle minutes |
-| **2 h, regardless** | holds no matter what — only the time limit, the battery floors, or you release it |
-| **Let it sleep normally** | releases |
+| **Keep awake while Claude works** | holds; releases when no session is mid-turn, or after 10 idle minutes |
+| **2 hours** | holds no matter what — only the time limit, the battery floors, or you release it |
+| **Let it sleep** | releases |
 | **Sleep now** | releases, then sleeps the Mac |
 | **Automatic** | hold while the agent works, release when it finishes (needs the hooks) |
 | **Only while plugged in** | on battery, behave like a normal laptop |
-| **Launch at login** | |
-| **Recent** | the last five events in plain words — *why* it held or released |
+| **Start when I log in** | |
+| **What happened** | the last five events in plain words — *why* it kept the Mac awake or let it sleep |
+| **?** | a two-line explanation and the icon legend |
 
-Icon: ☕ holding · moon normal · moon-zzz feature off · ⚠︎ orphaned hold. **⌃⌥A** opens it from anywhere.
+Icon: ☕ keeping it awake · moon normal sleep · moon-zzz turned off · ⚠︎ something's stuck. **⌃⌥A** opens it from anywhere.
 
 From a terminal: `agent-awake start [--minutes N] [--no-owner]`, `agent-awake stop`, `agent-awake status`, `agent-awake run -- <command>` (hold only while a command runs), `sleep-now`.
 
