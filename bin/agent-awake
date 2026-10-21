@@ -188,13 +188,14 @@ guard() {
 }
 
 start_hold() {
-  local minutes=0 floor="$FLOOR_DEFAULT" charging_only=0 parent=""
+  local minutes=0 floor="$FLOOR_DEFAULT" charging_only=0 parent="" force_battery=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --minutes) minutes="${2:-0}"; shift 2;;
       --battery-floor) floor="${2:-$FLOOR_DEFAULT}"; shift 2;;
       --charging-only) charging_only=1; shift;;
       --no-owner) parent="none"; shift;;
+      --force-battery) force_battery=1; shift;;
       --parent) parent="${2:-}"; shift 2;;
       *) shift;;
     esac
@@ -205,7 +206,9 @@ start_hold() {
     parent=$(owning_claude || true)
     [ -n "$parent" ] && say "owner: claude pid $parent"
   fi
-  plugged_in_only && charging_only=1
+  # An explicit "hold anyway" from the app wins over the plugged-in-only default; the
+  # battery floors still apply underneath it.
+  [ "$force_battery" = 1 ] || { plugged_in_only && charging_only=1; }
   local pct; pct=$(battery_pct)
   if [ "$charging_only" = 1 ] && ! on_charger; then
     say "refused: on battery and plugged-in-only is on"

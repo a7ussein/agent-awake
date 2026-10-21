@@ -36,6 +36,17 @@ def main():
         try:
             if time.time() - os.path.getmtime(STAMP) < THROTTLE: return 0
         except OSError: pass
+    # "Only while plugged in" (the default) means: on battery, do not even try. Trying logged a
+    # refusal on every prompt from every session and filled the app's Recent list with them.
+    if not os.path.exists(os.path.expanduser("~/.config/agent-awake/allow-on-battery")):
+        unplugged = os.environ.get("AGENT_AWAKE_TEST_UNPLUGGED")
+        if unplugged is None:
+            try:
+                out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5).stdout
+                unplugged = "" if "AC Power" in out else "1"
+            except Exception:
+                unplugged = ""
+        if unplugged: return 0
     try:
         # Arm only if nothing is holding; re-arming every prompt would spam notifications.
         st = subprocess.run([AWAKE, "status"], capture_output=True, text=True, timeout=10)

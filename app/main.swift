@@ -142,7 +142,9 @@ final class Model: ObservableObject {
             DispatchQueue.main.async { self.refresh(); self.busy = false }
         }
     }
+    var onBatteryBlocked: Bool { pluggedInOnly && !charging && mode != .holding }
     func holdUntilDone() { act([awake, "start", "--no-owner", "--minutes", "240"]) }
+    func holdAnyway() { act([awake, "start", "--no-owner", "--minutes", "240", "--force-battery"]) }
     func holdTwoHours() { act([awake, "start", "--no-owner", "--minutes", "120"], env: ["AGENT_AWAKE_REGARDLESS": "1"]) }
     func release() { act([awake, "stop"]) }
     func sleepMac() { act([sleepNow]) }
@@ -217,8 +219,22 @@ struct ContentView: View {
             .padding(10)
             .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
 
+            if model.onBatteryBlocked && model.mode != .off {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "bolt.slash").foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("On battery — holds are off").font(.callout.weight(.medium))
+                        Text("Plug in, turn off “Only while plugged in”, or hold anyway (the 25% and 10% floors still apply).").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
+            }
             VStack(spacing: 8) {
-                if model.mode == .holding || model.mode == .orphaned {
+                if model.onBatteryBlocked && model.mode != .off {
+                    Button(action: model.holdAnyway) { Label("Hold on battery anyway", systemImage: "cup.and.saucer").frame(maxWidth: .infinity) }
+                        .buttonStyle(.borderedProminent).controlSize(.large).tint(.orange)
+                } else if model.mode == .holding || model.mode == .orphaned {
                     Button(action: model.release) { Label("Let it sleep normally", systemImage: "moon").frame(maxWidth: .infinity) }
                         .buttonStyle(.borderedProminent).controlSize(.large).tint(tint == .secondary ? .accentColor : tint)
                 } else {
@@ -227,6 +243,7 @@ struct ContentView: View {
                 }
                 HStack(spacing: 8) {
                     Button(action: model.holdTwoHours) { Label("2 h, regardless", systemImage: "timer").frame(maxWidth: .infinity) }
+                        .disabled(model.onBatteryBlocked)
                     Button(action: model.sleepMac) { Label("Sleep now", systemImage: "powersleep").frame(maxWidth: .infinity) }
                 }.buttonStyle(.bordered).controlSize(.regular)
             }
@@ -366,7 +383,9 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
     let m = Model(); m.gatherInto()
     if CommandLine.arguments.count >= 4 {
         switch CommandLine.arguments[3] { case "holding": m.mode = .holding; m.sessions = 2; m.sessionNames = ["College/Classes", "Brain/memory"]; m.deadline = Date().addingTimeInterval(7200); m.watcher = "1"
-        case "off": m.mode = .off; case "orphaned": m.mode = .orphaned; default: m.mode = .normal }
+        case "off": m.mode = .off; case "orphaned": m.mode = .orphaned
+        case "battery": m.mode = .normal; m.charging = false; m.battery = 96; m.pluggedInOnly = true
+        default: m.mode = .normal }
     }
     let host = NSHostingView(rootView: ContentView(model: m))
     host.frame = NSRect(x: 0, y: 0, width: 320, height: host.fittingSize.height)
