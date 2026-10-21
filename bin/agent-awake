@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Hold the Mac awake with the lid shut, for exactly as long as a task needs — then let go.
+#
+# Built 2026-10-16 instead of cloning a commercial app. The underlying primitive is public:
+# `pmset disablesleep`, the same one Amphetamine's Enhancer, Sleepless (MIT) and LidRun all
+# call. The primitive is one line; everything below is the part that actually matters, which
+# is making sure the lock is ALWAYS released:
+#
+#   - released when the wrapped command exits, however it exits
+#   - released on Ctrl-C, SIGTERM, or the shell going away
+#   - released when the battery falls through a floor
+#   - released when a deadline passes
+#   - released on the next run if a previous one died without cleaning up
+#
+# `pmset disablesleep` is a persistent, machine-wide flag. Forgetting to clear it is the whole
+# failure mode of the bare command, and the reason apps charge for a wrapper.
+#
+#   agent-awake run --minutes 60 -- ./long-build.sh    # hold only while it runs
+#   agent-awake start --minutes 90                     # hold, with a deadline
+#   agent-awake stop                                   # release now
+#   agent-awake status
+set -uo pipefail
+
+STATE="$HOME/.local/state/agent-awake"
+PIDFILE="$STATE/guard.pid"
+LOG="$STATE/agent-awake.log"
+FLOOR_DEFAULT=25
+# Below this, unplugged, the Mac is put to sleep outright — Claude pauses, state is kept.
+# 2026-10-21: sessions churned all night, the floor stopped new holds at 25%, and the
+# battery still ran to 1% because "not holding" is not "asleep". Sleep is the only brake.
+CRITICAL_DEFAULT=${AGENT_AWAKE_CRITICAL:-10}
+# "Only while plugged in" is the default: every bad night this week was a hold on battery.
+# ~/.config/agent-awake/allow-on-battery turns it off (the menu-bar app's switch).
+ALLOW_ON_BATTERY_FLAG="$HOME/.config/agent-awake/allow-on-battery"
+plugged_in_only() { [ ! -f "$ALLOW_ON_BATTERY_FLAG" ]; }
+mkdir -p "$STATE"
+
+say() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG"; }
+note() { printf '%s\n' "$1" >&2; }
+
+# The Claude Code process that armed this hold. A `start` with no owner runs its full
+# deadline even if Claude crashed, quit or ran out of credit minutes later — on a closed lid
+# that is pure waste, which is exactly what Ahmed asked to stop.
+owning_claude() {
+  local p=$PPID
+  for _ in 1 2 3 4 5 6; do
+    [ -z "$p" ] || [ "$p" = "0" ] || [ "$p" = "1" ] && { [ "$p" = "1" ] && break; }
+    local comm; comm=$(ps -o comm= -p "$p" 2>/dev/null | xargs basename 2>/dev/null)
+    [ "$comm" = "claude" ] && { echo "$p"; return 0; }
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    [ -z "$p" ] && break
+  done
+  return 1
+}
+
+# Instantaneous idle, not `ps %cpu` — that is a LIFETIME average on macOS and sums to ~270%
+# on a machine doing nothing. Measured 2026-10-19: ~80% idle while actively working.
+cpu_idle_pct() {
+  top -l 2 -n 0 2>/dev/null | grep -i '^CPU usage' | tail -1 \
+    | sed -E 's/.*, ([0-9.]+)% idle.*/\1/' | cut -d. -f1
+}
+
+battery_pct() {
+  [ -n "${AGENT_AWAKE_TEST_BATT:-}" ] && { echo "$AGENT_AWAKE_TEST_BATT"; return; }
+  pmset -g batt 2>/dev/null | grep -oE '[0-9]+%' | head -1 | tr -d '%'
+}
+on_charger() {
+  [ -n "${AGENT_AWAKE_TEST_UNPLUGGED:-}" ] && return 1
+  pmset -g batt 2>/dev/null | grep -q "AC Power"
+}
+sleep_disabled() {
+  [ "$(pmset -g 2>/dev/null | awk '/SleepDisabled/{print $2}')" = "1" ]
+}
+
+hold() {
+  sleep_disabled || osascript -e 'display notification "Lid-close sleep is OFF while Claude works. To sleep now: sleep-now" with title "agent-awake: holding"' >/dev/null 2>&1 &
+  sudo -n pmset -a disablesleep 1 2>/dev/null || {
+    note "agent-awake: needs sudo for 'pmset disablesleep'."
+    note "  One-time, scoped to this command only:"
+    note "    echo \"$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep *\" | sudo tee /etc/sudoers.d/agent-awake"
+    note "    sudo chmod 440 /etc/sudoers.d/agent-awake"
+    return 1
+  }
+}
+# Drop the flag. Does NOT touch the guard — the guard calls this on its own way out, and a
+# function that killed its own caller would be a fine way to never finish.
+release() {
+  sudo -n pmset -a disablesleep 0 2>/dev/null || true
+  osascript -e 'display notification "Normal sleep restored." with title "agent-awake: released"' >/dev/null 2>&1 &
+  say "released (sleep re-enabled)"
+}
+
+# Stop whatever guard is running, then drop the flag. This is the user-facing stop and the
+# first half of taking a new hold.
+#
+# Both halves are needed. Killing the guard without dropping the flag leaves the machine awake
+# forever; dropping the flag without killing the guard leaves an orphan that wakes up later and
+# releases a lock a NEWER hold now owns — which is exactly what happened in testing: three
+# guards alive at once, and a 60-second deadline released after 5 because an older one fired.
+stop_all() {
+  local p; p=$(cat "$PIDFILE" 2>/dev/null || echo "")
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+    say "stopping guard pid $p"
+    kill "$p" 2>/dev/null || true
+    # Give it a moment to die so it cannot race us to release().
+    for _ in 1 2 3 4 5; do kill -0 "$p" 2>/dev/null || break; sleep 0.2; done
+  fi
+  rm -f "$PIDFILE"
+  release
+}
+
+# Taking a hold supersedes any previous one: the newest owner wins, and the old guard must not
+# outlive it.
+reap_stale() {
+  [ -f "$PIDFILE" ] || return 0
+  local p; p=$(cat "$PIDFILE" 2>/dev/null || echo "")
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+    say "superseding live guard pid $p"
+    kill "$p" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do kill -0 "$p" 2>/dev/null || break; sleep 0.2; done
+    rm -f "$PIDFILE"
+    return 0
+  fi
+  say "stale lock from pid ${p:-?} — clearing"
+  rm -f "$PIDFILE"
+  release
+}
+
+# Watches battery and the deadline, and lets go on its own. Without this the lock outlives
+# whatever reason it was taken for, which is the bare command's actual danger.
+guard() {
+  local deadline="$1" floor="$2" charging_only="$3" parent="$4"
+  local idle_ticks=0
+  local idle_limit="${AGENT_AWAKE_IDLE_TICKS:-30}"   # 30 x 20s = 10 minutes
+  local active="/tmp/agent-awake.active" markers_seen=0
+  while :; do
+    sleep 20
+    # "Claude finished" is the primary release. Markers older than 2h are a crashed session,
+    # and no claude process at all means nothing can be mid-turn.
+    if [ -z "${AGENT_AWAKE_REGARDLESS:-}" ] && [ -d "$active" ]; then
+      find "$active" -type f -mmin +120 -delete 2>/dev/null
+      pgrep -x claude >/dev/null 2>&1 || rm -f "$active"/* 2>/dev/null
+      if [ -n "$(ls -A "$active" 2>/dev/null)" ]; then markers_seen=1
+      elif [ "$markers_seen" = 1 ] || [ "${AGENT_AWAKE_MARKERS:-0}" = 1 ]; then
+        say "no session is mid-turn — Claude finished"; break
+      fi
+    fi
+    if [ -n "$parent" ] && ! kill -0 "$parent" 2>/dev/null; then
+      say "owner process $parent is gone (Claude exited, crashed or was quit)"; break
+    fi
+    # Sustained high idle means nothing is running. A single model response does not take
+    # ten minutes; a session sitting at a credit limit does.
+    idle=$(cpu_idle_pct)
+    [ -n "${AGENT_AWAKE_REGARDLESS:-}" ] && idle=""   # "for 2 hours, regardless": no idle release
+    if [ -n "$idle" ] && [ "$idle" -ge "${AGENT_AWAKE_IDLE_PCT:-92}" ]; then
+      idle_ticks=$((idle_ticks + 1))
+      if [ "$idle_ticks" -ge "$idle_limit" ]; then
+        say "machine idle (>=${AGENT_AWAKE_IDLE_PCT:-92}% for $((idle_limit*20/60))m) — nothing is running"; break
+      fi
+    else
+      idle_ticks=0
+    fi
+    [ "$deadline" != 0 ] && [ "$(date +%s)" -ge "$deadline" ] && { say "deadline reached"; break; }
+    local pct; pct=$(battery_pct)
+    if [ -n "$pct" ] && ! on_charger; then
+      if [ "$pct" -le "$CRITICAL_DEFAULT" ]; then
+        say "battery ${pct}% at or below critical ${CRITICAL_DEFAULT}% unplugged — releasing and SLEEPING the Mac to save it"
+        osascript -e 'display notification "Battery critical and unplugged. Claude paused; the Mac is going to sleep." with title "agent-awake: sleeping"' >/dev/null 2>&1
+        release; rm -f "$PIDFILE"; sleep 2
+        { [ -n "${AGENT_AWAKE_DRY_SLEEP:-}" ] && say "(dry run: would sleep now)" || osascript -e 'tell application "System Events" to sleep' >/dev/null 2>&1; }
+        exit 0
+      fi
+      if [ "$pct" -le "$floor" ]; then
+        say "battery ${pct}% at or below floor ${floor}%"
+        osascript -e 'display notification "Battery '"${pct}"'% and unplugged — hold released. Plug in, or Claude pauses at '"${CRITICAL_DEFAULT}"'%." with title "agent-awake: low battery"' >/dev/null 2>&1 &
+        break
+      fi
+      if [ "$charging_only" = 1 ]; then
+        say "unplugged and plugged-in-only is on"
+        osascript -e 'display notification "Unplugged — hold released. Only while plugged in is on." with title "agent-awake: released"' >/dev/null 2>&1 &
+        break
+      fi
+    fi
+  done
+  # Only clear the pidfile if it still names us; a newer hold may own it by now.
+  [ "$(cat "$PIDFILE" 2>/dev/null || echo)" = "$$" ] && rm -f "$PIDFILE"
+  release
+}
+
+start_hold() {
+  local minutes=0 floor="$FLOOR_DEFAULT" charging_only=0 parent=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --minutes) minutes="${2:-0}"; shift 2;;
+      --battery-floor) floor="${2:-$FLOOR_DEFAULT}"; shift 2;;
+      --charging-only) charging_only=1; shift;;
+      --no-owner) parent="none"; shift;;
+      --parent) parent="${2:-}"; shift 2;;
+      *) shift;;
+    esac
+  done
+  if [ "$parent" = "none" ]; then
+    parent=""; say "no owner: released only by deadline, floor, idle, or stop"
+  elif [ -z "$parent" ]; then
+    parent=$(owning_claude || true)
+    [ -n "$parent" ] && say "owner: claude pid $parent"
+  fi
+  plugged_in_only && charging_only=1
+  local pct; pct=$(battery_pct)
+  if [ "$charging_only" = 1 ] && ! on_charger; then
+    say "refused: on battery and plugged-in-only is on"
+    note "agent-awake: refusing — on battery, and \"only while plugged in\" is on."
+    return 1
+  fi
+  if [ -n "$pct" ] && ! on_charger && [ "$pct" -le "$floor" ]; then
+    say "refused: battery ${pct}% is at or below the ${floor}% floor and unplugged"
+    note "agent-awake: refusing — battery ${pct}% is already at or below the ${floor}% floor."
+    if [ "$pct" -le "$CRITICAL_DEFAULT" ]; then
+      say "battery ${pct}% critical unplugged — SLEEPING the Mac to save it"
+      osascript -e 'display notification "Battery critical and unplugged. Claude paused; the Mac is going to sleep." with title "agent-awake: sleeping"' >/dev/null 2>&1
+      sleep 2; { [ -n "${AGENT_AWAKE_DRY_SLEEP:-}" ] && say "(dry run: would sleep now)" || osascript -e 'tell application "System Events" to sleep' >/dev/null 2>&1; }
+    fi
+    return 1
+  fi
+  reap_stale   # only now: a refused start above has touched nothing
+  hold || return 1
+  local deadline=0
+  [ "$minutes" != 0 ] && deadline=$(( $(date +%s) + minutes * 60 ))
+  # Detached into its own session so the caller's process-group teardown cannot take it.
+  local gpid
+  gpid=$(python3 - "$0" "$deadline" "$floor" "$charging_only" "$parent" <<'PY'
+import os, subprocess, sys
+script, *args = sys.argv[1:]
+p = subprocess.Popen(["bash", script, "__guard", *args], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print(p.pid)
+PY
+)
+  echo "$gpid" > "$PIDFILE"
+  say "held (battery ${pct:-?}%, floor ${floor}%, $([ "$minutes" = 0 ] && echo 'no deadline' || echo "${minutes}m"))"
+  note "agent-awake: lid-close sleep disabled. Battery floor ${floor}%.$([ "$minutes" != 0 ] && echo " Auto-release in ${minutes}m.")"
+}
+
+case "${1:-status}" in
+  __guard) shift; guard "$@" ;;
+  start) shift; start_hold "$@" ;;
+
+  run)
+    shift
+    opts=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do opts+=("$1"); shift; done
+    [ "${1:-}" = "--" ] && shift
+    [ $# -gt 0 ] || { note "usage: agent-awake run [opts] -- <command>"; exit 2; }
+    start_hold "${opts[@]}" --parent $$ || exit 1
+    # Release however this ends: success, failure, Ctrl-C, SIGTERM.
+    trap 'stop_all' EXIT INT TERM
+    "$@"
+    rc=$?
+    say "command exited $rc"
+    exit $rc
+    ;;
+
+  stop) stop_all; note "agent-awake: released." ;;
+
+  status)
+    gp=$(cat "$PIDFILE" 2>/dev/null || echo)
+    if sleep_disabled; then
+      if [ -n "$gp" ] && kill -0 "$gp" 2>/dev/null; then
+        note "agent-awake: HOLDING — lid-close sleep is disabled; watcher pid $gp alive."
+      else
+        note "agent-awake: ORPHANED HOLD — sleep is disabled but NO watcher is alive."
+        note "  Nothing will release this: no floor, no deadline, no owner check."
+        note "  Re-arm with: agent-awake start [--minutes N]   or release: agent-awake stop"
+      fi
+    else
+      note "agent-awake: not holding (normal sleep)."
+    fi
+    note "  battery: $(battery_pct)%$(on_charger && echo ' (charging)')"
+    tail -3 "$LOG" 2>/dev/null | sed 's/^/  /' >&2
+    ;;
+
+  *) note "usage: agent-awake {run|start|stop|status}"; exit 2 ;;
+esac

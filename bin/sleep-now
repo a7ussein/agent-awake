@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Sleep the Mac even while Claude is working: release the hold, then sleep. Bind this to a key
+# (Shortcuts app -> Run Shell Script -> ~/.local/bin/sleep-now) and it IS the sleep button.
+~/.local/bin/agent-awake stop >/dev/null 2>&1
+rm -f /tmp/agent-awake.active/* 2>/dev/null
+osascript -e 'tell application "System Events" to sleep'
