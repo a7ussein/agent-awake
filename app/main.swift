@@ -110,7 +110,7 @@ final class Model: ObservableObject {
         for line in raw.split(separator: "\n").reversed() {
             let l = String(line); guard l.count > 20 else { continue }
             let stamp = String(l.prefix(19)); let msg = String(l.dropFirst(20))
-            if msg.hasPrefix("no owner") || msg.hasPrefix("superseding") || msg.hasPrefix("owner:") || msg.hasPrefix("(dry run") { continue }
+            if msg.hasPrefix("no owner") || msg.hasPrefix("superseding") || msg.hasPrefix("owner:") || msg.hasPrefix("(dry run") || msg.hasPrefix("(test)") { continue }
             let t = inFmt.date(from: stamp).map(clock12) ?? stamp.suffix(8).description
             let (text, sym): (String, String)
             if msg.hasPrefix("held") { (text, sym) = ("Held" + (msg.range(of: #"battery \d+%"#, options: .regularExpression).map { " · " + msg[$0] } ?? ""), "cup.and.saucer") }

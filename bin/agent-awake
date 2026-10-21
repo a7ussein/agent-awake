@@ -35,7 +35,11 @@ ALLOW_ON_BATTERY_FLAG="$HOME/.config/agent-awake/allow-on-battery"
 plugged_in_only() { [ ! -f "$ALLOW_ON_BATTERY_FLAG" ]; }
 mkdir -p "$STATE"
 
-say() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG"; }
+say() {
+  # Test seams active: tag the line so the app's Recent list can hide it.
+  local tag=""; [ -n "${AGENT_AWAKE_TEST_BATT:-}${AGENT_AWAKE_TEST_UNPLUGGED:-}" ] && tag="(test) "
+  printf '%s %s%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$tag" "$1" >> "$LOG"
+}
 note() { printf '%s\n' "$1" >&2; }
 
 # The Claude Code process that armed this hold. A `start` with no owner runs its full
