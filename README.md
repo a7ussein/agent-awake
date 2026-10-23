@@ -44,6 +44,7 @@ A prebuilt `Agent Awake.app` is attached to each release for people who don't wa
 | **Start when I log in** | |
 | **What happened** | the last five events in plain words — *why* it kept the Mac awake or let it sleep |
 | **?** | a two-line explanation and the icon legend |
+| **Using the battery** | the processes using real CPU right now (two `top` samples, not a lifetime average), who started them, and a **Quit** that asks once then stops the process. Auto-expands when something is above 25%. Also names anything holding the Mac out of idle sleep, such as a `caffeinate`. |
 
 Icon: ☕ keeping it awake · moon normal sleep · moon-zzz turned off · ⚠︎ something's stuck. **⌃⌥A** opens it from anywhere.
 

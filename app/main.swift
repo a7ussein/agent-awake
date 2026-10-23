@@ -16,6 +16,63 @@ let projectsDir = NSString(string: "~/.claude/projects").expandingTildeInPath
 func clock12(_ d: Date) -> String { let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "h:mm a"; return f.string(from: d) }
 func countdown(_ d: Date) -> String { let s = max(0, Int(d.timeIntervalSinceNow)); return s >= 3600 ? "\(s/3600)h \((s%3600)/60)m" : "\(s/60)m \(s%60)s" }
 struct Event: Identifiable { let id = UUID(); let time: String; let text: String; let symbol: String }
+struct Hog: Identifiable { let id: Int32; let name: String; let detail: String; let cpu: Double; let killable: Bool }
+let systemNames: Set<String> = ["kernel_task","WindowServer","launchd","loginwindow","coreaudiod","mds","mds_stores","mdworker","mdworker_shared","powerd","bluetoothd","wifid","Dock","Finder","SystemUIServer","ControlCenter","NotificationCenter","top","AgentAwake","com.apple.Virtua","Virtualization"]
+func friendly(_ pid: Int32) -> (String, String) {
+    // name from the full command line: for interpreters, show the module/script; then who started it.
+    let (_, cmd) = run(["/bin/ps", "-o", "command=", "-p", String(pid)])
+    let parts = cmd.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").map(String.init)
+    guard let exe = parts.first else { return ("", "") }   // caller falls back to top's own name
+    var name = (exe as NSString).lastPathComponent
+    if ["python","python3","python3.12","python3.13","python3.14","node","ruby","perl","java","uvicorn"].contains(where: { name.hasPrefix($0) }) {
+        if let i = parts.firstIndex(of: "-m"), parts.count > i + 1 { name = name + " · " + parts[i + 1] }
+        else if parts.count > 1 { name = name + " · " + (parts[1] as NSString).lastPathComponent }
+    }
+    let (_, pp) = run(["/bin/ps", "-o", "ppid=", "-p", String(pid)])
+    var detail = ""
+    if let ppid = Int32(pp.trimmingCharacters(in: .whitespacesAndNewlines)), ppid > 1 {
+        let (_, pcmd) = run(["/bin/ps", "-o", "comm=", "-p", String(ppid)])
+        let pname = (pcmd.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).lastPathComponent
+        if !pname.isEmpty { detail = "started by " + pname }
+    }
+    return (name, detail)
+}
+func topHogs() -> [Hog] {
+    // Two samples: the first is a lifetime average and useless, the second is "now".
+    let (_, out) = run(["/usr/bin/top", "-l", "2", "-s", "1", "-n", "8", "-o", "cpu", "-stats", "pid,cpu,command"])
+    guard let last = out.components(separatedBy: "PID").last else { return [] }
+    var hogs: [Hog] = []
+    for line in last.split(separator: "\n").dropFirst() {
+        let cols = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard cols.count >= 3, let pid = Int32(cols[0]), let cpu = Double(cols[1]) else { continue }
+        if cpu < 3 { continue }
+        let comm = cols[2...].joined(separator: " ")
+        if pid == 0 { continue }   // kernel_task: not a thing anyone can quit
+        var (name, detail) = friendly(pid)
+        if name.isEmpty { name = comm; detail = "" }   // already gone, or not ours to inspect
+        let killable = !systemNames.contains(where: { comm.hasPrefix($0) || name.hasPrefix($0) }) && pid != ProcessInfo.processInfo.processIdentifier && !detail.isEmpty || (!systemNames.contains(where: { comm.hasPrefix($0) }) && kill(pid, 0) == 0 && !name.isEmpty && pid != ProcessInfo.processInfo.processIdentifier)
+        hogs.append(Hog(id: pid, name: name, detail: detail, cpu: cpu, killable: killable))
+        if hogs.count == 5 { break }
+    }
+    return hogs
+}
+func sleepBlockers() -> [String] {
+    let (_, out) = run(["/usr/bin/pmset", "-g", "assertions"])
+    var names: [String] = []
+    for line in out.split(separator: "\n") where line.contains("PreventUserIdleSystemSleep named") || line.contains("PreventSystemSleep named") {
+        let l = String(line)
+        guard let a = l.range(of: "("), let b = l.range(of: ")") , a.upperBound < b.lowerBound else { continue }
+        let proc = String(l[a.upperBound..<b.lowerBound])
+        if ["powerd","coreaudiod","WindowServer"].contains(proc) { continue }
+        if !names.contains(proc) { names.append(proc) }
+    }
+    return names
+}
+func quitProcess(_ pid: Int32) -> String {
+    kill(pid, SIGTERM); usleep(1_500_000)
+    if kill(pid, 0) == 0 { kill(pid, SIGKILL); usleep(300_000) }
+    return kill(pid, 0) == 0 ? "still running" : "stopped"
+}
 
 @discardableResult
 func run(_ args: [String], env: [String: String] = [:]) -> (Int32, String) {
@@ -41,6 +98,10 @@ final class Model: ObservableObject {
     @Published var busy = false
     @Published var launchAtLogin = false
     @Published var showHelp = false
+    @Published var hogs: [Hog] = []
+    @Published var blockers: [String] = []
+    @Published var showHogs = false
+    @Published var confirmPid: Int32? = nil
     @Published var pluggedInOnly = true
     @Published var sessionNames: [String] = []
     @Published var events: [Event] = []
@@ -56,13 +117,20 @@ final class Model: ObservableObject {
         let snapshot = Model.gather()
         DispatchQueue.main.async { self.apply(snapshot) }
     }
-    struct Snapshot { var mode: Mode; var battery: Int; var charging: Bool; var watcher: String; var deadline: Date?; var sessions: Int; var launchAtLogin: Bool; var pluggedInOnly: Bool; var sessionNames: [String]; var events: [Event] }
+    struct Snapshot { var mode: Mode; var battery: Int; var charging: Bool; var watcher: String; var deadline: Date?; var sessions: Int; var launchAtLogin: Bool; var pluggedInOnly: Bool; var sessionNames: [String]; var events: [Event]; var hogs: [Hog]; var blockers: [String] }
     func apply(_ s: Snapshot) {
         mode = s.mode; battery = s.battery; charging = s.charging; watcher = s.watcher; deadline = s.deadline; sessions = s.sessions
         launchAtLogin = s.launchAtLogin; pluggedInOnly = s.pluggedInOnly; sessionNames = s.sessionNames; events = s.events
+        hogs = s.hogs; blockers = s.blockers
+        if hogs.contains(where: { $0.cpu >= 25 }) { showHogs = true }
     }
     static func gather() -> Snapshot {
-        let m = Model(); m.gatherInto(); return Snapshot(mode: m.mode, battery: m.battery, charging: m.charging, watcher: m.watcher, deadline: m.deadline, sessions: m.sessions, launchAtLogin: m.launchAtLogin, pluggedInOnly: m.pluggedInOnly, sessionNames: m.sessionNames, events: m.events)
+        let m = Model(); m.gatherInto(); return Snapshot(mode: m.mode, battery: m.battery, charging: m.charging, watcher: m.watcher, deadline: m.deadline, sessions: m.sessions, launchAtLogin: m.launchAtLogin, pluggedInOnly: m.pluggedInOnly, sessionNames: m.sessionNames, events: m.events, hogs: m.hogs, blockers: m.blockers)
+    }
+    func quit(_ pid: Int32) {
+        if confirmPid != pid { confirmPid = pid; DispatchQueue.main.asyncAfter(deadline: .now() + 4) { if self.confirmPid == pid { self.confirmPid = nil } }; return }
+        confirmPid = nil; busy = true
+        DispatchQueue.global().async { _ = quitProcess(pid); DispatchQueue.main.async { self.refresh(); self.busy = false } }
     }
     func gatherInto() {
         let (_, o) = run([awake, "status"])
@@ -83,6 +151,7 @@ final class Model: ObservableObject {
         sessions = (try? FileManager.default.contentsOfDirectory(atPath: activeDir).filter { !$0.hasPrefix(".") }.count) ?? 0
         launchAtLogin = FileManager.default.fileExists(atPath: loginPlist)
         pluggedInOnly = !FileManager.default.fileExists(atPath: allowOnBatteryFlag)
+        hogs = topHogs(); blockers = sleepBlockers()
         sessionNames = ((try? FileManager.default.contentsOfDirectory(atPath: activeDir)) ?? []).filter { !$0.hasPrefix(".") }.map(projectName)
         events = recentEvents()
     }
@@ -220,6 +289,42 @@ struct ContentView: View {
             .padding(10)
             .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
 
+            if !model.hogs.isEmpty || !model.blockers.isEmpty {
+                let hot = model.hogs.first.map { $0.cpu >= 25 } ?? false
+                VStack(alignment: .leading, spacing: 6) {
+                    Button(action: { model.showHogs.toggle() }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: hot ? "flame.fill" : "gauge.with.dots.needle.33percent").foregroundStyle(hot ? .orange : .secondary)
+                            Text(hot ? "Something is eating the battery" : "Using the battery").font(.callout.weight(.medium))
+                            Spacer()
+                            if let h = model.hogs.first { Text("\(h.name.prefix(22)) \(Int(h.cpu))%").font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+                            Image(systemName: model.showHogs ? "chevron.up" : "chevron.down").font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }.buttonStyle(.plain)
+                    if model.showHogs {
+                        ForEach(model.hogs) { h in
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(h.name).font(.caption.weight(.medium)).lineLimit(1)
+                                    if !h.detail.isEmpty { Text(h.detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1) }
+                                }
+                                Spacer()
+                                Text("\(Int(h.cpu))%").font(.caption).monospacedDigit().foregroundStyle(h.cpu >= 25 ? .orange : .secondary)
+                                if h.killable {
+                                    Button(model.confirmPid == h.id ? "Sure?" : "Quit") { model.quit(h.id) }
+                                        .buttonStyle(.bordered).controlSize(.mini).tint(model.confirmPid == h.id ? .red : .accentColor)
+                                } else { Text("system").font(.caption2).foregroundStyle(.tertiary) }
+                            }
+                        }
+                        if !model.blockers.isEmpty {
+                            Text("Keeping the Mac from idling: " + model.blockers.joined(separator: ", ")).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                        Text("CPU right now, not an average. Quit asks once, then stops the process.").font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(hot ? Color.orange.opacity(0.12) : Color.primary.opacity(0.05)))
+            }
             if model.onBatteryBlocked && model.mode != .off {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "bolt.slash").foregroundStyle(.orange)
@@ -388,6 +493,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // --snapshot <png> [holding|normal|off|orphaned]: render the popover offscreen and exit. The
 // only reliable way to look at the UI from a script — a transient popover closes before a
 // screenshot can catch it.
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--quit", let qp = Int32(CommandLine.arguments[2]) {
+    print("quit \(qp): \(quitProcess(qp))"); exit(0)   // the same path the button uses
+}
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--hogs" {
+    let napp = NSApplication.shared; napp.setActivationPolicy(.prohibited); napp.finishLaunching()
+    for h in topHogs() { print("\(h.id)\t\(Int(h.cpu))%\t\(h.killable ? "quit" : "system")\t\(h.name)\t\(h.detail)") }
+    print("blockers: \(sleepBlockers().joined(separator: ", "))"); exit(0)
+}
 if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--icon" {
     // --icon out.png <symbol> [size] : the status-bar glyph as a PNG, for documentation.
     let napp = NSApplication.shared; napp.setActivationPolicy(.prohibited); napp.finishLaunching()
@@ -411,6 +524,9 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
         switch CommandLine.arguments[3] { case "holding": m.mode = .holding; m.sessions = 2; m.sessionNames = ["College/Classes", "Brain/memory"]; m.deadline = Date().addingTimeInterval(7200); m.watcher = "1"
         case "off": m.mode = .off; case "orphaned": m.mode = .orphaned
         case "battery": m.mode = .normal; m.charging = false; m.battery = 96; m.pluggedInOnly = true
+        case "hogs": m.mode = .normal; m.charging = false; m.battery = 41; m.showHogs = true
+            m.hogs = [Hog(id: 60623, name: "python · uvicorn", detail: "started by aegra", cpu: 84, killable: true), Hog(id: 72338, name: "com.apple.Virtualization", detail: "started by launchd", cpu: 5, killable: false), Hog(id: 419, name: "WindowServer", detail: "", cpu: 4, killable: false)]
+            m.blockers = ["caffeinate"]
         default: m.mode = .normal }
     }
     let host = NSHostingView(rootView: ContentView(model: m))
