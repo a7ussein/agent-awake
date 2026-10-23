@@ -39,19 +39,29 @@ func friendly(_ pid: Int32) -> (String, String) {
     let (_, lsofPorts) = run(["/usr/sbin/lsof", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-P", "-Fn"])
     for l in lsofPorts.split(separator: "\n") where l.hasPrefix("n") { if let colon = l.lastIndex(of: ":") { let port = String(l[l.index(after: colon)...]); if !ports.contains(port) { ports.append(port) } } }
     // --- who started it: climb parents, keep the most telling names
-    var origin: [String] = []; var pp = pid
+    var origin: [String] = []; var pp = pid; var chain: [Int32] = [pid]
     for _ in 0..<6 {
         let (_, ppidS) = run(["/bin/ps", "-o", "ppid=", "-p", String(pp)])
         guard let ppid = Int32(ppidS.trimmingCharacters(in: .whitespacesAndNewlines)), ppid > 1 else { if pp != pid { origin.append("launchd") }; break }
         let (_, pcmd) = run(["/bin/ps", "-o", "command=", "-p", String(ppid)])
         let pc = pcmd.trimmingCharacters(in: .whitespacesAndNewlines); var pname = ((pc.split(separator: " ").first.map(String.init) ?? "") as NSString).lastPathComponent
         if pname.hasPrefix("-") { pname = String(pname.dropFirst()) }
-        if pname == "tmux" { if let r = pc.range(of: "-s ") { let rest = pc[r.upperBound...]; origin.append("tmux “" + rest.split(separator: " ").first.map(String.init)! + "”") } else { origin.append("tmux") } }
+        if pname == "tmux" {
+            // The tmux server is one process for every session; its argv names whichever session
+            // started it. Ask tmux which pane owns a pid in this chain instead.
+            var sess = ""
+            for tm in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] where FileManager.default.isExecutableFile(atPath: tm) {
+                let (_, panes) = run([tm, "list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"])
+                for l in panes.split(separator: "\n") { let c = l.split(separator: "\t"); if c.count == 2, let ppid2 = Int32(c[1]), chain.contains(ppid2) { sess = String(c[0]); break } }
+                break
+            }
+            origin.append(sess.isEmpty ? "tmux" : "tmux “" + sess + "”"); break
+        }
         else if pname.hasSuffix(".sh") || pc.contains(".sh ") { let sh = pc.split(separator: " ").first(where: { $0.hasSuffix(".sh") }).map { ($0 as NSString).lastPathComponent } ?? pname; origin.append(sh) }
         else if pname == "claude" { origin.append("a Claude Code session") }
         else if pname == "codex" { origin.append("Codex") }
         else if !["zsh","bash","sh","login","python","python3","node","perl"].contains(where: { pname.hasPrefix($0) }) && !pname.isEmpty { origin.append(pname) }
-        pp = ppid
+        pp = ppid; chain.append(ppid)
     }
     // --- what it is
     let low = cmd.lowercased(); var label = exe
@@ -70,8 +80,9 @@ func friendly(_ pid: Int32) -> (String, String) {
     else if has("/mcp") || has("mcp-server") || has("-mcp") || has("mcp ") { let name = parts.first(where: { $0.contains("mcp") }).map { ($0 as NSString).lastPathComponent } ?? "mcp"; label = "MCP server · " + name.replacingOccurrences(of: "-mcp", with: "").replacingOccurrences(of: "mcp-", with: "") }
     else if has("vite") || has("next dev") || has("astro dev") || has("webpack") { label = "Dev server (" + (has("vite") ? "vite" : (has("next") ? "next" : "astro")) + ")" }
     else if has("agentawake") { label = "Agent Awake" }
-    else if exe.hasPrefix("python") || exe == "node" || exe == "ruby" {
-        if let i = parts.firstIndex(of: "-m"), parts.count > i + 1 { label = exe + " · " + parts[i + 1] } else if parts.count > 1 { label = exe + " · " + (parts[1] as NSString).lastPathComponent }
+    else if exe.lowercased().hasPrefix("python") || exe == "node" || exe == "ruby" {
+        let shown = exe.lowercased().hasPrefix("python") ? "python" : exe
+        if let i = parts.firstIndex(of: "-m"), parts.count > i + 1 { label = shown + " · " + parts[i + 1] } else if parts.count > 1 { label = shown + " · " + (parts[1] as NSString).lastPathComponent }
     }
     if !ports.isEmpty { label += " · port " + ports.prefix(2).joined(separator: ", ") }
     var where_ = folder.isEmpty ? "" : "in " + folder
