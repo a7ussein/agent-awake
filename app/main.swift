@@ -18,25 +18,67 @@ func countdown(_ d: Date) -> String { let s = max(0, Int(d.timeIntervalSinceNow)
 struct Event: Identifiable { let id = UUID(); let time: String; let text: String; let symbol: String }
 struct Hog: Identifiable { let id: Int32; let name: String; let detail: String; let cpu: Double; let killable: Bool }
 let systemNames: Set<String> = ["kernel_task","WindowServer","launchd","loginwindow","coreaudiod","mds","mds_stores","mdworker","mdworker_shared","powerd","bluetoothd","wifid","Dock","Finder","SystemUIServer","ControlCenter","NotificationCenter","top","AgentAwake","com.apple.Virtua","Virtualization"]
+/// What a process IS, in plain words, from evidence: its command line, the folder it runs in,
+/// the ports it listens on, and who started it. Returns (label, where-and-origin).
 func friendly(_ pid: Int32) -> (String, String) {
-    // name from the full command line: for interpreters, show the module/script; then who started it.
-    let (_, cmd) = run(["/bin/ps", "-o", "command=", "-p", String(pid)])
-    let parts = cmd.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").map(String.init)
-    guard let exe = parts.first else { return ("", "") }   // caller falls back to top's own name
-    var name = (exe as NSString).lastPathComponent
-    if ["python","python3","python3.12","python3.13","python3.14","node","ruby","perl","java","uvicorn"].contains(where: { name.hasPrefix($0) }) {
-        if let i = parts.firstIndex(of: "-m"), parts.count > i + 1 { name = name + " · " + parts[i + 1] }
-        else if parts.count > 1 { name = name + " · " + (parts[1] as NSString).lastPathComponent }
+    let (_, cmdRaw) = run(["/bin/ps", "-o", "command=", "-p", String(pid)])
+    let cmd = cmdRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cmd.isEmpty else { return ("", "") }
+    let parts = cmd.split(separator: " ").map(String.init)
+    let exe = (parts.first! as NSString).lastPathComponent
+    let home = NSHomeDirectory()
+    // --- where: working directory, shown relative to home
+    var folder = ""
+    let (_, lsofCwd) = run(["/usr/sbin/lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn"])
+    if let n = lsofCwd.split(separator: "\n").first(where: { $0.hasPrefix("n/") }) {
+        var f = String(n.dropFirst()); if f.hasPrefix(home) { f = "~" + f.dropFirst(home.count) }
+        if f != "~" && f != "/" { folder = f }
     }
-    let (_, pp) = run(["/bin/ps", "-o", "ppid=", "-p", String(pid)])
-    var detail = ""
-    if let ppid = Int32(pp.trimmingCharacters(in: .whitespacesAndNewlines)), ppid > 1 {
-        let (_, pcmd) = run(["/bin/ps", "-o", "comm=", "-p", String(ppid)])
-        let pname = (pcmd.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).lastPathComponent
-        if !pname.isEmpty { detail = "started by " + pname }
+    // --- ports it serves
+    var ports: [String] = []
+    let (_, lsofPorts) = run(["/usr/sbin/lsof", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-P", "-Fn"])
+    for l in lsofPorts.split(separator: "\n") where l.hasPrefix("n") { if let colon = l.lastIndex(of: ":") { let port = String(l[l.index(after: colon)...]); if !ports.contains(port) { ports.append(port) } } }
+    // --- who started it: climb parents, keep the most telling names
+    var origin: [String] = []; var pp = pid
+    for _ in 0..<6 {
+        let (_, ppidS) = run(["/bin/ps", "-o", "ppid=", "-p", String(pp)])
+        guard let ppid = Int32(ppidS.trimmingCharacters(in: .whitespacesAndNewlines)), ppid > 1 else { if pp != pid { origin.append("launchd") }; break }
+        let (_, pcmd) = run(["/bin/ps", "-o", "command=", "-p", String(ppid)])
+        let pc = pcmd.trimmingCharacters(in: .whitespacesAndNewlines); var pname = ((pc.split(separator: " ").first.map(String.init) ?? "") as NSString).lastPathComponent
+        if pname.hasPrefix("-") { pname = String(pname.dropFirst()) }
+        if pname == "tmux" { if let r = pc.range(of: "-s ") { let rest = pc[r.upperBound...]; origin.append("tmux “" + rest.split(separator: " ").first.map(String.init)! + "”") } else { origin.append("tmux") } }
+        else if pname.hasSuffix(".sh") || pc.contains(".sh ") { let sh = pc.split(separator: " ").first(where: { $0.hasSuffix(".sh") }).map { ($0 as NSString).lastPathComponent } ?? pname; origin.append(sh) }
+        else if pname == "claude" { origin.append("a Claude Code session") }
+        else if pname == "codex" { origin.append("Codex") }
+        else if !["zsh","bash","sh","login","python","python3","node","perl"].contains(where: { pname.hasPrefix($0) }) && !pname.isEmpty { origin.append(pname) }
+        pp = ppid
     }
-    return (name, detail)
+    // --- what it is
+    let low = cmd.lowercased(); var label = exe
+    func has(_ k: String) -> Bool { low.contains(k) }
+    let macosNames: [String: String] = ["suggestd": "Siri suggestions (macOS)", "spotlightknowledged": "Spotlight learning (macOS)", "mds": "Spotlight indexing (macOS)", "mds_stores": "Spotlight indexing (macOS)", "mdworker": "Spotlight indexing (macOS)", "mdworker_shared": "Spotlight indexing (macOS)", "photoanalysisd": "Photos analysis (macOS)", "photolibraryd": "Photos library (macOS)", "com.apple.WebKit.WebContent": "a web page (Safari or an app's browser view)", "WindowServer": "Screen drawing (macOS)", "coreaudiod": "Audio (macOS)", "kernel_task": "macOS kernel", "bird": "iCloud Drive sync (macOS)", "cloudd": "iCloud sync (macOS)", "backupd": "Time Machine (macOS)", "softwareupdated": "Software Update (macOS)", "trustd": "Certificates (macOS)", "syspolicyd": "Gatekeeper (macOS)", "corespotlightd": "Spotlight (macOS)", "sharingd": "AirDrop / Handoff (macOS)", "mediaanalysisd": "Media analysis (macOS)"]
+    let isSystemPath = parts.first!.hasPrefix("/System/") || parts.first!.hasPrefix("/usr/libexec/") || parts.first!.hasPrefix("/usr/sbin/") || low.contains("/system/library/")
+    if let nice = macosNames[exe] { return (nice, "macOS, not yours to quit") }
+    if isSystemPath && !["caffeinate"].contains(exe) { return (exe + " (macOS)", "macOS, not yours to quit") }
+    if exe == "caffeinate" { label = "caffeinate — keeping the Mac awake" }
+    else if exe == "claude" { label = "Claude Code session" }
+    else if exe == "codex" { label = "Codex session" }
+    else if has("hermes_cli") || has("hermes-agent") { label = "Hermes (room manager)" }
+    else if exe == "ollama" || has("ollama") { label = "Ollama (local AI models)" }
+    else if has("com.apple.virtualization") { label = "Linux VM (container runtime)" }
+    else if has("uvicorn") || has("gunicorn") || has("fastapi") || has("flask") { let mod = parts.first(where: { $0.contains(":app") || $0.contains("_api") || $0.contains(".main") }) ?? ""; label = "API server" + (mod.isEmpty ? "" : " · " + mod.replacingOccurrences(of: ":app", with: "")) }
+    else if has("/mcp") || has("mcp-server") || has("-mcp") || has("mcp ") { let name = parts.first(where: { $0.contains("mcp") }).map { ($0 as NSString).lastPathComponent } ?? "mcp"; label = "MCP server · " + name.replacingOccurrences(of: "-mcp", with: "").replacingOccurrences(of: "mcp-", with: "") }
+    else if has("vite") || has("next dev") || has("astro dev") || has("webpack") { label = "Dev server (" + (has("vite") ? "vite" : (has("next") ? "next" : "astro")) + ")" }
+    else if has("agentawake") { label = "Agent Awake" }
+    else if exe.hasPrefix("python") || exe == "node" || exe == "ruby" {
+        if let i = parts.firstIndex(of: "-m"), parts.count > i + 1 { label = exe + " · " + parts[i + 1] } else if parts.count > 1 { label = exe + " · " + (parts[1] as NSString).lastPathComponent }
+    }
+    if !ports.isEmpty { label += " · port " + ports.prefix(2).joined(separator: ", ") }
+    var where_ = folder.isEmpty ? "" : "in " + folder
+    if !origin.isEmpty { where_ += (where_.isEmpty ? "" : " · ") + "started by " + origin.prefix(2).joined(separator: " → ") }
+    return (label, where_)
 }
+
 func topHogs() -> [Hog] {
     // Two samples: the first is a lifetime average and useless, the second is "now".
     let (_, out) = run(["/usr/bin/top", "-l", "2", "-s", "1", "-n", "8", "-o", "cpu", "-stats", "pid,cpu,command"])
@@ -50,6 +92,7 @@ func topHogs() -> [Hog] {
         if pid == 0 { continue }   // kernel_task: not a thing anyone can quit
         var (name, detail) = friendly(pid)
         if name.isEmpty { name = comm; detail = "" }   // already gone, or not ours to inspect
+        if detail.hasPrefix("macOS") { hogs.append(Hog(id: pid, name: name, detail: "", cpu: cpu, killable: false)); if hogs.count == 5 { break }; continue }
         let killable = !systemNames.contains(where: { comm.hasPrefix($0) || name.hasPrefix($0) }) && pid != ProcessInfo.processInfo.processIdentifier && !detail.isEmpty || (!systemNames.contains(where: { comm.hasPrefix($0) }) && kill(pid, 0) == 0 && !name.isEmpty && pid != ProcessInfo.processInfo.processIdentifier)
         hogs.append(Hog(id: pid, name: name, detail: detail, cpu: cpu, killable: killable))
         if hogs.count == 5 { break }
@@ -63,7 +106,7 @@ func sleepBlockers() -> [String] {
         let l = String(line)
         guard let a = l.range(of: "("), let b = l.range(of: ")") , a.upperBound < b.lowerBound else { continue }
         let proc = String(l[a.upperBound..<b.lowerBound])
-        if ["powerd","coreaudiod","WindowServer"].contains(proc) { continue }
+        if ["powerd","coreaudiod","WindowServer","sharingd","bluetoothd","hidd"].contains(proc) { continue }
         if !names.contains(proc) { names.append(proc) }
     }
     return names
@@ -496,6 +539,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--quit", let qp = Int32(CommandLine.arguments[2]) {
     print("quit \(qp): \(quitProcess(qp))"); exit(0)   // the same path the button uses
 }
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--describe", let dp = Int32(CommandLine.arguments[2]) {
+    let (l, w) = friendly(dp); print("\(dp)\t\(l)\t\(w)"); exit(0)
+}
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--hogs" {
     let napp = NSApplication.shared; napp.setActivationPolicy(.prohibited); napp.finishLaunching()
     for h in topHogs() { print("\(h.id)\t\(Int(h.cpu))%\t\(h.killable ? "quit" : "system")\t\(h.name)\t\(h.detail)") }
@@ -525,7 +571,7 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--snapshot" {
         case "off": m.mode = .off; case "orphaned": m.mode = .orphaned
         case "battery": m.mode = .normal; m.charging = false; m.battery = 96; m.pluggedInOnly = true
         case "hogs": m.mode = .normal; m.charging = false; m.battery = 41; m.showHogs = true
-            m.hogs = [Hog(id: 60623, name: "python · uvicorn", detail: "started by aegra", cpu: 84, killable: true), Hog(id: 72338, name: "com.apple.Virtualization", detail: "started by launchd", cpu: 5, killable: false), Hog(id: 419, name: "WindowServer", detail: "", cpu: 4, killable: false)]
+            m.hogs = [Hog(id: 60623, name: "API server · aegra_api.main · port 5002", detail: "in ~/Hackathon/templates/template-agent · started by up.sh → tmux “hack”", cpu: 84, killable: true), Hog(id: 72338, name: "Linux VM (container runtime)", detail: "", cpu: 5, killable: false), Hog(id: 419, name: "Screen drawing (macOS)", detail: "", cpu: 4, killable: false)]
             m.blockers = ["caffeinate"]
         default: m.mode = .normal }
     }
