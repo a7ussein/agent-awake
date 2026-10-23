@@ -62,6 +62,10 @@ Other agents: anything that can run a shell command can use `agent-awake run -- 
 - A loop that never finishes, on battery, is a dead battery by construction. "Only while plugged in" is on by default for that reason, and the 10% floor is the brake under it.
 - A file another process writes during a session's turn is attributed to that turn. Seconds of exposure, not zero.
 
+## Power
+
+The app itself idles at about 0.1% CPU and spawns nothing while the popover is closed (a cheap status check every 30 s). CPU per process is read in-process from the kernel's task accounting, sampled twice 0.7 s apart — no `top`, no `lsof`, no `ps` per row — so measuring never shows up in its own list. Heavy work runs only while the popover is open, and the list you see on opening is the last background sample, taken before the opening animation, so the menu bar and WindowServer are not blamed for the redraw you just caused.
+
 ## Uninstall
 
 `./uninstall.sh` — removes everything except the sudo rule, which it tells you how to remove.

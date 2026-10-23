@@ -20,20 +20,25 @@ struct Hog: Identifiable { let id: Int32; let name: String; let detail: String; 
 let systemNames: Set<String> = ["kernel_task","WindowServer","launchd","loginwindow","coreaudiod","mds","mds_stores","mdworker","mdworker_shared","powerd","bluetoothd","wifid","Dock","Finder","SystemUIServer","ControlCenter","NotificationCenter","top","AgentAwake","com.apple.Virtua","Virtualization"]
 /// What a process IS, in plain words, from evidence: its command line, the folder it runs in,
 /// the ports it listens on, and who started it. Returns (label, where-and-origin).
+let macosNamesTable: [String: String] = ["suggestd": "Siri suggestions (macOS)", "spotlightknowledged": "Spotlight learning (macOS)", "mds": "Spotlight indexing (macOS)", "mds_stores": "Spotlight indexing (macOS)", "mdworker": "Spotlight indexing (macOS)", "mdworker_shared": "Spotlight indexing (macOS)", "photoanalysisd": "Photos analysis (macOS)", "photolibraryd": "Photos library (macOS)", "com.apple.WebKit.WebContent": "a web page (Safari or an app's browser view)", "WindowServer": "Screen drawing (macOS)", "coreaudiod": "Audio (macOS)", "kernel_task": "macOS kernel", "bird": "iCloud Drive sync (macOS)", "cloudd": "iCloud sync (macOS)", "backupd": "Time Machine (macOS)", "softwareupdated": "Software Update (macOS)", "trustd": "Certificates (macOS)", "syspolicyd": "Gatekeeper (macOS)", "corespotlightd": "Spotlight (macOS)", "sharingd": "AirDrop / Handoff (macOS)", "mediaanalysisd": "Media analysis (macOS)"]
+
 func friendly(_ pid: Int32) -> (String, String) {
     let (_, cmdRaw) = run(["/bin/ps", "-o", "command=", "-p", String(pid)])
     let cmd = cmdRaw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !cmd.isEmpty else { return ("", "") }
+    // Fast exits for the kernel's own: no lsof, no ps ancestry.
+    if procPath(pid).hasPrefix("/System/") || procPath(pid).hasPrefix("/usr/libexec/") {
+        let exe0 = (procPath(pid) as NSString).lastPathComponent
+        if let nice = macosNamesTable[exe0] { return (nice, "macOS, not yours to quit") }
+        return (exe0 + " (macOS)", "macOS, not yours to quit")
+    }
     let parts = cmd.split(separator: " ").map(String.init)
     let exe = (parts.first! as NSString).lastPathComponent
     let home = NSHomeDirectory()
     // --- where: working directory, shown relative to home
-    var folder = ""
-    let (_, lsofCwd) = run(["/usr/sbin/lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn"])
-    if let n = lsofCwd.split(separator: "\n").first(where: { $0.hasPrefix("n/") }) {
-        var f = String(n.dropFirst()); if f.hasPrefix(home) { f = "~" + f.dropFirst(home.count) }
-        if f != "~" && f != "/" { folder = f }
-    }
+    var folder = procCwd(pid)
+    if folder.hasPrefix(home) { folder = "~" + folder.dropFirst(home.count) }
+    if folder == "~" || folder == "/" { folder = "" }
     // --- ports it serves
     var ports: [String] = []
     let (_, lsofPorts) = run(["/usr/sbin/lsof", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-P", "-Fn"])
@@ -66,7 +71,7 @@ func friendly(_ pid: Int32) -> (String, String) {
     // --- what it is
     let low = cmd.lowercased(); var label = exe
     func has(_ k: String) -> Bool { low.contains(k) }
-    let macosNames: [String: String] = ["suggestd": "Siri suggestions (macOS)", "spotlightknowledged": "Spotlight learning (macOS)", "mds": "Spotlight indexing (macOS)", "mds_stores": "Spotlight indexing (macOS)", "mdworker": "Spotlight indexing (macOS)", "mdworker_shared": "Spotlight indexing (macOS)", "photoanalysisd": "Photos analysis (macOS)", "photolibraryd": "Photos library (macOS)", "com.apple.WebKit.WebContent": "a web page (Safari or an app's browser view)", "WindowServer": "Screen drawing (macOS)", "coreaudiod": "Audio (macOS)", "kernel_task": "macOS kernel", "bird": "iCloud Drive sync (macOS)", "cloudd": "iCloud sync (macOS)", "backupd": "Time Machine (macOS)", "softwareupdated": "Software Update (macOS)", "trustd": "Certificates (macOS)", "syspolicyd": "Gatekeeper (macOS)", "corespotlightd": "Spotlight (macOS)", "sharingd": "AirDrop / Handoff (macOS)", "mediaanalysisd": "Media analysis (macOS)"]
+    let macosNames = macosNamesTable
     let isSystemPath = parts.first!.hasPrefix("/System/") || parts.first!.hasPrefix("/usr/libexec/") || parts.first!.hasPrefix("/usr/sbin/") || low.contains("/system/library/")
     if let nice = macosNames[exe] { return (nice, "macOS, not yours to quit") }
     if isSystemPath && !["caffeinate"].contains(exe) { return (exe + " (macOS)", "macOS, not yours to quit") }
@@ -79,7 +84,7 @@ func friendly(_ pid: Int32) -> (String, String) {
     else if has("uvicorn") || has("gunicorn") || has("fastapi") || has("flask") { let mod = parts.first(where: { $0.contains(":app") || $0.contains("_api") || $0.contains(".main") }) ?? ""; label = "API server" + (mod.isEmpty ? "" : " · " + mod.replacingOccurrences(of: ":app", with: "")) }
     else if has("/mcp") || has("mcp-server") || has("-mcp") || has("mcp ") { let name = parts.first(where: { $0.contains("mcp") }).map { ($0 as NSString).lastPathComponent } ?? "mcp"; label = "MCP server · " + name.replacingOccurrences(of: "-mcp", with: "").replacingOccurrences(of: "mcp-", with: "") }
     else if has("vite") || has("next dev") || has("astro dev") || has("webpack") { label = "Dev server (" + (has("vite") ? "vite" : (has("next") ? "next" : "astro")) + ")" }
-    else if has("agentawake") { label = "Agent Awake" }
+    else if exe == "AgentAwake" { label = "Agent Awake" }   // by executable, not by substring: a test marker in a command line once matched this
     else if exe.lowercased().hasPrefix("python") || exe == "node" || exe == "ruby" {
         let shown = exe.lowercased().hasPrefix("python") ? "python" : exe
         if let i = parts.firstIndex(of: "-m"), parts.count > i + 1 { label = shown + " · " + parts[i + 1] } else if parts.count > 1 { label = shown + " · " + (parts[1] as NSString).lastPathComponent }
@@ -90,26 +95,62 @@ func friendly(_ pid: Int32) -> (String, String) {
     return (label, where_)
 }
 
+/// Per-process CPU from the kernel's own accounting, sampled twice in-process. No `top`, no
+/// subprocess, no 1-second busy sample that itself shows up in the list. (2026-10-23: the old
+/// sampler spawned `top` during the popover's opening animation and then reported the menu bar
+/// and WindowServer as the battery hogs — the observer was the load.)
+func cpuTimes() -> [Int32: Double] {
+    // PROC_PIDTASKINFO: user+system CPU in nanoseconds per pid, via a plain struct. (The
+    // proc_pid_rusage binding aborts in Swift on this macOS — proven with a 6-line probe.)
+    var out: [Int32: Double] = [:]
+    let n = proc_listallpids(nil, 0); guard n > 0 else { return out }
+    var pids = [Int32](repeating: 0, count: Int(n) + 64)
+    let got = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<Int32>.size))
+    let size = Int32(MemoryLayout<proc_taskinfo>.size)
+    // pti_total_* are mach absolute-time ticks (24 MHz on Apple Silicon), not nanoseconds: a
+    // fresh process read 43,794 in the probe. Convert with the timebase or everything rounds to 0.
+    var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
+    let nsPerTick = Double(tb.numer) / Double(tb.denom)
+    for i in 0..<Int(got) where pids[i] > 0 {
+        var ti = proc_taskinfo()
+        if proc_pidinfo(pids[i], PROC_PIDTASKINFO, 0, &ti, size) == size { out[pids[i]] = Double(ti.pti_total_user + ti.pti_total_system) * nsPerTick }
+    }
+    return out
+}
+func procName(_ pid: Int32) -> String {
+    var buf = [CChar](repeating: 0, count: 1024); let n = proc_name(pid, &buf, UInt32(buf.count)); return n > 0 ? String(cString: buf) : ""
+}
+func procPath(_ pid: Int32) -> String {
+    var buf = [CChar](repeating: 0, count: 4096); let n = proc_pidpath(pid, &buf, UInt32(buf.count)); return n > 0 ? String(cString: buf) : ""
+}
+func procCwd(_ pid: Int32) -> String {
+    var info = proc_vnodepathinfo(); let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return "" }
+    return withUnsafePointer(to: &info.pvi_cdir.vip_path) { $0.withMemoryRebound(to: CChar.self, capacity: 1024) { String(cString: $0) } }
+}
+var lastHogs: [Hog] = []; var lastBlockers: [String] = []
+var describeCache: [Int32: (String, String, Date)] = [:]
 func topHogs() -> [Hog] {
-    // Two samples: the first is a lifetime average and useless, the second is "now".
-    let (_, out) = run(["/usr/bin/top", "-l", "2", "-s", "1", "-n", "8", "-o", "cpu", "-stats", "pid,cpu,command"])
-    guard let last = out.components(separatedBy: "PID").last else { return [] }
+    let a = cpuTimes(); let t0 = Date(); usleep(700_000); let b = cpuTimes(); let dt = Date().timeIntervalSince(t0)
+    var rows: [(Int32, Double)] = []
+    for (pid, now) in b { if let then = a[pid] { let pct = (now - then) / 1e9 / dt * 100; if pct >= 3 { rows.append((pid, pct)) } } }
+    rows.sort { $0.1 > $1.1 }
     var hogs: [Hog] = []
-    for line in last.split(separator: "\n").dropFirst() {
-        let cols = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        guard cols.count >= 3, let pid = Int32(cols[0]), let cpu = Double(cols[1]) else { continue }
-        if cpu < 3 { continue }
-        let comm = cols[2...].joined(separator: " ")
-        if pid == 0 { continue }   // kernel_task: not a thing anyone can quit
-        var (name, detail) = friendly(pid)
-        if name.isEmpty { name = comm; detail = "" }   // already gone, or not ours to inspect
+    for (pid, cpu) in rows.prefix(8) {
+        if pid == 0 || pid == ProcessInfo.processInfo.processIdentifier { continue }
+        let comm = procName(pid)
+        var name = "", detail = ""
+        if let c = describeCache[pid], Date().timeIntervalSince(c.2) < 90 { (name, detail) = (c.0, c.1) }
+        else { (name, detail) = friendly(pid); describeCache[pid] = (name, detail, Date()) }
+        if name.isEmpty { name = comm; detail = "" }
         if detail.hasPrefix("macOS") { hogs.append(Hog(id: pid, name: name, detail: "", cpu: cpu, killable: false)); if hogs.count == 5 { break }; continue }
-        let killable = !systemNames.contains(where: { comm.hasPrefix($0) || name.hasPrefix($0) }) && pid != ProcessInfo.processInfo.processIdentifier && !detail.isEmpty || (!systemNames.contains(where: { comm.hasPrefix($0) }) && kill(pid, 0) == 0 && !name.isEmpty && pid != ProcessInfo.processInfo.processIdentifier)
+        let killable = !systemNames.contains(where: { comm.hasPrefix($0) || name.hasPrefix($0) }) && kill(pid, 0) == 0
         hogs.append(Hog(id: pid, name: name, detail: detail, cpu: cpu, killable: killable))
         if hogs.count == 5 { break }
     }
     return hogs
 }
+
 func sleepBlockers() -> [String] {
     let (_, out) = run(["/usr/bin/pmset", "-g", "assertions"])
     var names: [String] = []
@@ -153,8 +194,11 @@ final class Model: ObservableObject {
     @Published var launchAtLogin = false
     @Published var showHelp = false
     @Published var hogs: [Hog] = []
+    var gatherHeavy = false
     @Published var blockers: [String] = []
     @Published var showHogs = false
+    var userToggledHogs = false
+    var wasHot = false
     @Published var confirmPid: Int32? = nil
     @Published var pluggedInOnly = true
     @Published var sessionNames: [String] = []
@@ -162,13 +206,15 @@ final class Model: ObservableObject {
 
     private var refreshing = false
     /// Shell work off the main thread; publish on it. The popover never hitches on `status`.
+    var heavyWanted = false   // set by the app while the popover is open
     func refresh() {
         if Thread.isMainThread {
             if refreshing { return }; refreshing = true
-            DispatchQueue.global(qos: .userInitiated).async { self.refresh(); DispatchQueue.main.async { self.refreshing = false } }
+            let heavy = heavyWanted
+            DispatchQueue.global(qos: .utility).async { let snap = Model.gather(heavy: heavy); DispatchQueue.main.async { self.apply(snap); self.refreshing = false } }
             return
         }
-        let snapshot = Model.gather()
+        let snapshot = Model.gather(heavy: heavyWanted)
         DispatchQueue.main.async { self.apply(snapshot) }
     }
     struct Snapshot { var mode: Mode; var battery: Int; var charging: Bool; var watcher: String; var deadline: Date?; var sessions: Int; var launchAtLogin: Bool; var pluggedInOnly: Bool; var sessionNames: [String]; var events: [Event]; var hogs: [Hog]; var blockers: [String] }
@@ -176,10 +222,14 @@ final class Model: ObservableObject {
         mode = s.mode; battery = s.battery; charging = s.charging; watcher = s.watcher; deadline = s.deadline; sessions = s.sessions
         launchAtLogin = s.launchAtLogin; pluggedInOnly = s.pluggedInOnly; sessionNames = s.sessionNames; events = s.events
         hogs = s.hogs; blockers = s.blockers
-        if hogs.contains(where: { $0.cpu >= 25 }) { showHogs = true }
+        // Open by itself while something is hot; close by itself when it is not — unless the
+        // person opened or closed it by hand, which wins until the next hot/cold change.
+        let hot = hogs.contains(where: { $0.cpu >= 25 })
+        if hot != wasHot { showHogs = hot; userToggledHogs = false; wasHot = hot }
+        else if !userToggledHogs { showHogs = hot }
     }
-    static func gather() -> Snapshot {
-        let m = Model(); m.gatherInto(); return Snapshot(mode: m.mode, battery: m.battery, charging: m.charging, watcher: m.watcher, deadline: m.deadline, sessions: m.sessions, launchAtLogin: m.launchAtLogin, pluggedInOnly: m.pluggedInOnly, sessionNames: m.sessionNames, events: m.events, hogs: m.hogs, blockers: m.blockers)
+    static func gather(heavy: Bool = false) -> Snapshot {
+        let m = Model(); m.gatherHeavy = heavy; m.gatherInto(); return Snapshot(mode: m.mode, battery: m.battery, charging: m.charging, watcher: m.watcher, deadline: m.deadline, sessions: m.sessions, launchAtLogin: m.launchAtLogin, pluggedInOnly: m.pluggedInOnly, sessionNames: m.sessionNames, events: m.events, hogs: m.hogs, blockers: m.blockers)
     }
     func quit(_ pid: Int32) {
         if confirmPid != pid { confirmPid = pid; DispatchQueue.main.asyncAfter(deadline: .now() + 4) { if self.confirmPid == pid { self.confirmPid = nil } }; return }
@@ -205,7 +255,8 @@ final class Model: ObservableObject {
         sessions = (try? FileManager.default.contentsOfDirectory(atPath: activeDir).filter { !$0.hasPrefix(".") }.count) ?? 0
         launchAtLogin = FileManager.default.fileExists(atPath: loginPlist)
         pluggedInOnly = !FileManager.default.fileExists(atPath: allowOnBatteryFlag)
-        hogs = topHogs(); blockers = sleepBlockers()
+        if gatherHeavy { hogs = topHogs(); blockers = sleepBlockers() } else { hogs = lastHogs; blockers = lastBlockers }
+        lastHogs = hogs; lastBlockers = blockers
         sessionNames = ((try? FileManager.default.contentsOfDirectory(atPath: activeDir)) ?? []).filter { !$0.hasPrefix(".") }.map(projectName)
         events = recentEvents()
     }
@@ -346,7 +397,7 @@ struct ContentView: View {
             if !model.hogs.isEmpty || !model.blockers.isEmpty {
                 let hot = model.hogs.first.map { $0.cpu >= 25 } ?? false
                 VStack(alignment: .leading, spacing: 6) {
-                    Button(action: { model.showHogs.toggle() }) {
+                    Button(action: { model.showHogs.toggle(); model.userToggledHogs = true }) {
                         HStack(spacing: 6) {
                             Image(systemName: hot ? "flame.fill" : "gauge.with.dots.needle.33percent").foregroundStyle(hot ? .orange : .secondary)
                             Text(hot ? "Something is eating the battery" : "Using the battery").font(.callout.weight(.medium))
@@ -480,6 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     let popover = NSPopover()
     let model = Model()
+    var tick = 0
     var hosting: NSHostingController<ContentView>!
     /// Size the popover from the content BEFORE it shows, and cap it to the screen. NSPopover
     /// keeps its bottom edge when content grows after presentation, so a taller Recent list
@@ -521,7 +573,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
-        Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { _ in self.model.refresh(); self.updateIcon(); if self.popover.isShown { self.fitPopover() } }
+        Timer.scheduledTimer(withTimeInterval: 6, repeats: true) { _ in
+            // Closed: a cheap tick every 30 s for the icon only. Open: every 6 s with the full sample.
+            self.tick += 1
+            if self.popover.isShown { self.model.heavyWanted = true; self.model.refresh(); self.updateIcon(); self.fitPopover() }
+            else if self.tick % 5 == 0 { self.model.heavyWanted = false; self.model.refresh(); self.updateIcon() }
+        }
     }
     func updateIcon() {
         let name: String
@@ -536,9 +593,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? "\(Date().timeIntervalSince1970)".write(toFile: "/tmp/agent-awake-menu.last-toggle", atomically: true, encoding: .utf8)
         guard let b = item.button else { return }
         if popover.isShown { popover.performClose(nil); return }
-        model.refresh(); updateIcon(); fitPopover()
+        model.heavyWanted = false; model.refresh(); updateIcon(); fitPopover()   // last background sample, instantly
         popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { if self.popover.isShown { self.model.heavyWanted = true; self.model.refresh() } }   // after the animation, not during
         NSApp.activate(ignoringOtherApps: true)
+        // No keyboard focus ring on the first control when opened from the hotkey.
+        DispatchQueue.main.async { self.popover.contentViewController?.view.window?.makeFirstResponder(nil) }
         // Content can still settle a frame later (SwiftUI lays out lazily); re-fit once.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.fitPopover() }
     }
